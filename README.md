@@ -1,4 +1,4 @@
-# Game Launcher — Instalador .msi
+# Game Launcher
 
 ## Inicio rapido
 
