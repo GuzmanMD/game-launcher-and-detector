@@ -45,9 +45,12 @@ async function initDB() {
       value TEXT
     );
   `);
-  // Migrar: añadir columnas si no existen (para DBs antiguas)
-  try { db.run(`ALTER TABLE games ADD COLUMN cover TEXT`);   } catch {}
-  try { db.run(`ALTER TABLE games ADD COLUMN steam_id INTEGER`); } catch {}
+  // Migrar columnas que pueden faltar en DBs antiguas
+  try { db.run(`ALTER TABLE games   ADD COLUMN cover     TEXT`);    } catch {}
+  try { db.run(`ALTER TABLE games   ADD COLUMN steam_id  INTEGER`); } catch {}
+  try { db.run(`ALTER TABLE folders ADD COLUMN type      TEXT DEFAULT 'custom'`); } catch {}
+  try { db.run(`ALTER TABLE folders ADD COLUMN label     TEXT`);    } catch {}
+  try { db.run(`ALTER TABLE folders ADD COLUMN added_at  TEXT`);    } catch {}
 
   for (const [k, v] of [
     ['accent','#e84855'],['theme','dark'],
@@ -161,78 +164,115 @@ function isLikelyGame(filePath) {
   return true;
 }
 
-// ── Scanning CON TIMEOUT ──────────────────────────────────────────────────────
-// El timeout evita que se quede colgado en carpetas enormes o inaccesibles
+// ── Scanning ASYNC con timeout real ──────────────────────────────────────────
+// Usamos fs.promises (no bloquea el hilo) + AbortController para timeout real.
+// fs.readdirSync bloqueaba Node completamente — esto no.
 
-function scanWithTimeout(fn, timeoutMs = 8000) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve([]), timeoutMs);
-    try {
-      const result = fn();
-      clearTimeout(timer);
-      resolve(result);
-    } catch {
-      clearTimeout(timer);
-      resolve([]);
-    }
-  });
-}
+const fsp = require('fs').promises;
 
-function scanSteamCommon(commonPath) {
+async function scanSteamCommon(commonPath, deadline) {
   const results = [];
   let entries;
-  try { entries = fs.readdirSync(commonPath, { withFileTypes: true }); } catch { return results; }
+  try { entries = await fsp.readdir(commonPath, { withFileTypes: true }); } catch { return results; }
+
   for (const entry of entries) {
+    if (Date.now() > deadline) break;          // timeout real
     if (!entry.isDirectory()) continue;
     const gameDir = path.join(commonPath, entry.name);
     let exes = [];
     try {
-      exes = fs.readdirSync(gameDir, { withFileTypes: true })
+      const files = await fsp.readdir(gameDir, { withFileTypes: true });
+      exes = files
         .filter(f => f.isFile() && f.name.toLowerCase().endsWith('.exe'))
         .map(f => path.join(gameDir, f.name))
         .filter(isLikelyGame);
     } catch { continue; }
+
     if (!exes.length) {
+      // Buscar un nivel más adentro
       try {
-        for (const s of fs.readdirSync(gameDir, { withFileTypes: true })) {
+        const subs = await fsp.readdir(gameDir, { withFileTypes: true });
+        for (const s of subs) {
+          if (Date.now() > deadline) break;
           if (!s.isDirectory()) continue;
-          exes.push(...fs.readdirSync(path.join(gameDir, s.name), { withFileTypes: true })
-            .filter(f => f.isFile() && f.name.toLowerCase().endsWith('.exe'))
-            .map(f => path.join(gameDir, s.name, f.name))
-            .filter(isLikelyGame));
+          try {
+            const subFiles = await fsp.readdir(path.join(gameDir, s.name), { withFileTypes: true });
+            exes.push(...subFiles
+              .filter(f => f.isFile() && f.name.toLowerCase().endsWith('.exe'))
+              .map(f => path.join(gameDir, s.name, f.name))
+              .filter(isLikelyGame));
+          } catch {}
         }
       } catch {}
     }
+
     if (!exes.length) continue;
-    exes.sort((a, b) => { try { return fs.statSync(b).size - fs.statSync(a).size; } catch { return 0; } });
+    // Elegir el .exe más grande (suele ser el principal)
+    exes.sort((a, b) => {
+      try { return fs.statSync(b).size - fs.statSync(a).size; } catch { return 0; }
+    });
     results.push({ name: entry.name, exe_path: exes[0] });
   }
   return results;
 }
 
-function scanGeneric(folderPath, depth = 0, maxDepth = 3) {
+async function scanGeneric(folderPath, deadline, depth = 0, maxDepth = 3) {
   const results = [];
-  if (depth > maxDepth) return results;
+  if (depth > maxDepth || Date.now() > deadline) return results;
   let entries;
-  try { entries = fs.readdirSync(folderPath, { withFileTypes: true }); } catch { return results; }
+  try { entries = await fsp.readdir(folderPath, { withFileTypes: true }); } catch { return results; }
+
   for (const entry of entries) {
+    if (Date.now() > deadline) break;
     const full = path.join(folderPath, entry.name);
-    if (entry.isDirectory()) results.push(...scanGeneric(full, depth + 1, maxDepth));
-    else if (entry.isFile() && entry.name.toLowerCase().endsWith('.exe') && isLikelyGame(full))
+    if (entry.isDirectory()) {
+      const sub = await scanGeneric(full, deadline, depth + 1, maxDepth);
+      results.push(...sub);
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.exe') && isLikelyGame(full)) {
       results.push({ name: path.basename(full, '.exe'), exe_path: full });
+    }
   }
   return results;
 }
 
 function findSteamCommon(folderPath) {
-  const low = folderPath.toLowerCase();
-  if (low.includes('steamapps')) {
-    const parts = folderPath.split(path.sep);
-    const idx   = parts.findIndex(p => p.toLowerCase() === 'steamapps');
-    if (idx !== -1) { const c = path.join(...parts.slice(0, idx + 1), 'common'); if (fs.existsSync(c)) return c; }
+  // Normalizar separadores para comparación consistente
+  const norm = folderPath.replace(/\\/g, '/');
+  const low  = norm.toLowerCase();
+
+  // Caso 1: el usuario seleccionó directamente .../steamapps/common
+  if (low.endsWith('steamapps/common') || low.endsWith('steamapps\\common')) {
+    if (fs.existsSync(folderPath)) return folderPath;
   }
+
+  // Caso 2: el usuario seleccionó .../steamapps  (sin /common)
+  if (low.endsWith('/steamapps') || low.endsWith('\\steamapps')) {
+    const c = path.join(folderPath, 'common');
+    if (fs.existsSync(c)) return c;
+  }
+
+  // Caso 3: la ruta contiene 'steamapps' en algún punto intermedio
+  if (low.includes('steamapps')) {
+    // Subir hasta steamapps y bajar a common
+    const parts = folderPath.replace(/\\/g, '/').split('/');
+    const idx   = parts.map(p => p.toLowerCase()).lastIndexOf('steamapps');
+    if (idx !== -1) {
+      const c = parts.slice(0, idx + 1).join('/') + '/common';
+      const cNorm = path.normalize(c);
+      if (fs.existsSync(cNorm)) return cNorm;
+    }
+  }
+
+  // Caso 4: el usuario seleccionó la carpeta de Steam raíz (contiene steamapps como hijo)
   const c1 = path.join(folderPath, 'steamapps', 'common');
   if (fs.existsSync(c1)) return c1;
+
+  // Caso 5: carpeta con nombre 'steam' o 'steam library' — buscar steamapps dentro
+  if (low.includes('steam')) {
+    const c2 = path.join(folderPath, 'Steam', 'steamapps', 'common');
+    if (fs.existsSync(c2)) return c2;
+  }
+
   return null;
 }
 
@@ -270,17 +310,58 @@ ipcMain.handle('db:updateGameCover', (_, { id, cover, steam_id, name }) => {
   return { ok: true };
 });
 
+// ── Normalizar path — siempre forward slashes, sin trailing slash ─────────────
+function normalizePath(p) {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
 // ── IPC: folders ──────────────────────────────────────────────────────────────
-ipcMain.handle('db:getFolders',   ()       => queryAll('SELECT * FROM folders ORDER BY label'));
+ipcMain.handle('db:getFolders', () => queryAll('SELECT * FROM folders ORDER BY label'));
 ipcMain.handle('db:removeFolder', (_, id) => { runSave('DELETE FROM folders WHERE id=?', [id]); return { ok: true }; });
+
 ipcMain.handle('db:addFolder', (_, { folderPath, type }) => {
   try {
-    const label = path.basename(folderPath) || folderPath;
-    db.run(`INSERT OR IGNORE INTO folders(path,label,type) VALUES(?,?,?)`, [folderPath, label, type || 'custom']);
+    if (!folderPath) return { ok: false, error: 'No folder path provided' };
+
+    const normPath   = normalizePath(folderPath);
+    const label      = path.basename(normPath) || normPath;
+    const folderType = type || 'custom';
+
+    console.log('[addFolder] normPath:', normPath);
+
+    // 1. Eliminar duplicados con formato diferente
+    const allExisting = queryAll('SELECT * FROM folders');
+    for (const row of allExisting) {
+      if (normalizePath(row.path) === normPath && row.path !== normPath) {
+        console.log('[addFolder] removing duplicate:', row.path);
+        db.run('DELETE FROM folders WHERE id=?', [row.id]);
+      }
+    }
+
+    // 2. INSERT OR REPLACE — siempre crea o actualiza el registro
+    db.run(
+      `INSERT OR REPLACE INTO folders(path, label, type) VALUES(?, ?, ?)`,
+      [normPath, label, folderType]
+    );
     saveDB();
-    const folder = queryGet('SELECT * FROM folders WHERE path=?', [folderPath]);
+    console.log('[addFolder] inserted/replaced');
+
+    // 3. SELECT para obtener el id asignado
+    const folder = queryGet('SELECT * FROM folders WHERE path=?', [normPath]);
+    console.log('[addFolder] queryGet result:', JSON.stringify(folder));
+
+    if (!folder) {
+      // Listar todo lo que hay en la BD para debug
+      const all = queryAll('SELECT * FROM folders');
+      console.log('[addFolder] all folders in DB:', JSON.stringify(all));
+      return { ok: false, error: `Record not found after insert. DB has ${all.length} folders.` };
+    }
+
     return { ok: true, folder };
-  } catch (e) { return { ok: false, error: e.message }; }
+  } catch (e) {
+    console.error('[addFolder] exception:', e.message, e.stack);
+    return { ok: false, error: e.message };
+  }
 });
 
 // ── IPC: settings ─────────────────────────────────────────────────────────────
@@ -290,21 +371,33 @@ ipcMain.handle('db:isFirstRun',  ()                => { const r = queryGet(`SELE
 
 // ── IPC: scan CON TIMEOUT ─────────────────────────────────────────────────────
 ipcMain.handle('scan:folder', async (_, folderPath) => {
-  // Verificar que la ruta existe antes de escanear
-  if (!fs.existsSync(folderPath)) return { results: [], mode: 'generic' };
+  try {
+    if (!folderPath) return { results: [], mode: 'generic', steamCommon: null };
+    // Convertir a backslashes para fs (Windows lo necesita para existsSync)
+    const winPath = folderPath.replace(/\//g, '\\');
+    if (!fs.existsSync(winPath) && !fs.existsSync(folderPath))
+      return { results: [], mode: 'generic', steamCommon: null };
+    folderPath = fs.existsSync(winPath) ? winPath : folderPath;
 
-  const sc = findSteamCommon(folderPath);
-  if (sc) {
-    const results = await scanWithTimeout(() => scanSteamCommon(sc), 10000);
-    return { results, mode: 'steam', steamCommon: sc };
+    const TIMEOUT_MS = 12000;
+    const deadline   = Date.now() + TIMEOUT_MS;
+
+    const sc = findSteamCommon(folderPath);
+    if (sc) {
+      const results = await scanSteamCommon(sc, deadline);
+      return { results: results || [], mode: 'steam', steamCommon: normalizePath(sc) };
+    }
+    const low = folderPath.toLowerCase().replace(/\\/g, '/');
+    if (low.endsWith('steamapps/common')) {
+      const results = await scanSteamCommon(folderPath, deadline);
+      return { results: results || [], mode: 'steam', steamCommon: normalizePath(folderPath) };
+    }
+    const results = await scanGeneric(folderPath, deadline);
+    return { results: results || [], mode: 'generic', steamCommon: null };
+  } catch (e) {
+    console.error('scan:folder error:', e);
+    return { results: [], mode: 'generic', steamCommon: null };
   }
-  const low = folderPath.toLowerCase().replace(/\\/g, '/');
-  if (low.endsWith('steamapps/common')) {
-    const results = await scanWithTimeout(() => scanSteamCommon(folderPath), 10000);
-    return { results, mode: 'steam', steamCommon: folderPath };
-  }
-  const results = await scanWithTimeout(() => scanGeneric(folderPath), 10000);
-  return { results, mode: 'generic' };
 });
 
 ipcMain.handle('scan:importResults', (_, { games, folderId }) => {
@@ -372,6 +465,14 @@ function createWindow() {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
   });
   mainWin.loadFile(path.join(__dirname, 'index.html'));
+  // Abrir DevTools con F12
+  mainWin.webContents.on('before-input-event', (_, input) => {
+    if (input.key === 'F12') mainWin.webContents.openDevTools({ mode: 'detach' });
+  });
+  // Log errores del renderer en consola de Node
+  mainWin.webContents.on('console-message', (_, level, message, line, sourceId) => {
+    if (level >= 2) console.error(`[Renderer L${level}] ${message}  (${sourceId}:${line})`);
+  });
 }
 
 app.whenReady().then(async () => {

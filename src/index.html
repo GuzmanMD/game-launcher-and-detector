@@ -221,10 +221,17 @@
 <div id="game-picker-modal" class="modal hidden">
   <div class="modal-box picker-box">
     <h3>Añadir juego</h3>
-    <p class="picker-sub">Escribe el nombre del juego. Se buscará la portada automáticamente en Steam.</p>
+
+    <!-- Referencia del .exe detectado -->
+    <div class="picker-exe-ref-row">
+      <span class="picker-exe-label">Ejecutable:</span>
+      <span id="picker-exe-ref" class="picker-exe-ref">—</span>
+    </div>
+
+    <p class="picker-sub">Escribe el nombre del juego. La portada se busca automáticamente en Steam.</p>
 
     <div class="picker-name-row">
-      <label>Nombre del juego</label>
+      <label>Nombre</label>
       <input id="picker-name" type="text" placeholder="ej: Phasmophobia, Alan Wake 2…"
              autocomplete="off"
              oninput="pickerOnNameInput()"
@@ -236,10 +243,16 @@
       <div id="picker-preview-status" class="picker-preview-status"></div>
     </div>
 
-    <div class="modal-btns" style="margin-top:14px">
-      <button class="btn-secondary" onclick="closeGamePicker()">Cancelar</button>
+    <div class="modal-btns" style="margin-top:14px;flex-wrap:wrap;gap:6px">
+      <button class="btn-secondary" onclick="closeGamePicker()">✕ Cancelar todo</button>
+      <button class="btn-secondary hidden" id="picker-skip-all" onclick="pickerSkipAll()">
+        Saltar restantes
+      </button>
+      <button class="btn-secondary hidden" id="picker-skip" onclick="pickerSkip()">
+        Saltar este →
+      </button>
       <button class="btn-primary" id="picker-confirm" onclick="pickerConfirm()">
-        ✓ Añadir juego
+        ✓ Confirmar
       </button>
     </div>
   </div>

@@ -185,21 +185,68 @@ function bindToolbar() {
 async function doAddFolder() {
   const folder = await api.selectFolder();
   if (!folder) return;
-  const prog = showScanProgress('Analizando carpeta…');
-  const { results = [], mode, steamCommon } = await api.scanFolder(folder);
-  prog.remove();
-  const savePath = steamCommon || folder;
-  const res = await api.addFolder(savePath, mode === 'steam' ? 'steam' : 'custom');
-  if (!res?.folder) { toast('Error al añadir la carpeta.', ''); return; }
-  if (results.length) {
-    await api.importResults({ games: results, folderId: res.folder.id });
-    toast(`${mode === 'steam' ? '🎮 Steam' : '📂 Carpeta'}: ${results.length} juegos encontrados`, 'success');
-  } else {
-    toast('Carpeta añadida. No se detectaron juegos nuevos.', '');
-  }
-  await loadGames(); await renderFolderSidebar(); await renderSettingsView();
-}
 
+  const prog = showScanProgress('Escaneando…');
+
+  // 1. Escanear
+  let scanResult = { results: [], mode: 'generic', steamCommon: null };
+  try {
+    const r = await api.scanFolder(folder);
+    if (r && typeof r === 'object') scanResult = r;
+  } catch (e) {
+    prog.remove(); toast('Error al escanear: ' + e.message, ''); return;
+  }
+
+  const { results = [], mode = 'generic', steamCommon = null } = scanResult;
+  const savePath = steamCommon || folder;
+
+  // 2. Guardar carpeta
+  updateScanProgress(prog, 'Guardando…');
+  let folderRecord = null;
+  try {
+    const res = await api.addFolder(savePath, mode === 'steam' ? 'steam' : 'custom');
+    if (res && res.folder) {
+      folderRecord = res.folder;
+    } else {
+      // Mostrar el error real en pantalla para debug
+      const errDetail = res ? (res.error || JSON.stringify(res)) : 'sin respuesta';
+      prog.remove();
+      toast('Error BD: ' + errDetail, '');
+      return;
+    }
+  } catch (e) {
+    prog.remove(); toast('Excepción: ' + e.message, ''); return;
+  }
+
+  // 3. Actualizar UI
+  updateScanProgress(prog, 'Listo');
+  await renderFolderSidebar();
+  await renderSettingsView();
+  prog.remove();
+
+  if (!results.length) {
+    toast('Carpeta añadida sin juegos detectados.', '');
+    return;
+  }
+
+  // 4. Juegos nuevos
+  let existingPaths = new Set();
+  try {
+    existingPaths = new Set((await api.getGames()).map(g => g.exe_path.toLowerCase()));
+  } catch {}
+
+  const newGames = results
+    .filter(r => r && r.exe_path && !existingPaths.has(r.exe_path.toLowerCase()))
+    .map(r => ({ name: r.name, exe_path: r.exe_path, folderId: folderRecord.id }));
+
+  if (!newGames.length) {
+    toast('Todos los juegos ya estaban añadidos.', '');
+    return;
+  }
+
+  toast((mode === 'steam' ? '🎮 ' : '📂 ') + newGames.length + ' juego' + (newGames.length !== 1 ? 's' : '') + ' nuevos encontrados.', 'success');
+  openPickerQueue(newGames);
+}
 async function doAddExe() {
   const exePath = await api.selectExe();
   if (!exePath) return;
@@ -212,14 +259,29 @@ async function doScan() {
   const folders = await api.getFolders();
   if (!folders.length) { toast('Añade al menos una carpeta primero.', ''); return; }
   const prog = showScanProgress('Escaneando…');
-  let total = 0;
+
+  // Recopilar todos los juegos encontrados (solo los que NO están ya en la BD)
+  const existing   = new Set((await api.getGames()).map(g => g.exe_path.toLowerCase()));
+  const newGames   = [];   // { name, exe_path, folderId }
+
   for (const folder of folders) {
     const { results = [] } = await api.scanFolder(folder.path);
-    if (results.length) { await api.importResults({ games: results, folderId: folder.id }); total += results.length; }
+    for (const r of results) {
+      if (!existing.has(r.exe_path.toLowerCase())) {
+        newGames.push({ name: r.name, exe_path: r.exe_path, folderId: folder.id });
+      }
+    }
   }
   prog.remove();
-  toast(`Escaneo completado — ${total} juego${total!==1?'s':''} encontrado${total!==1?'s':''}.`, 'success');
-  await loadGames();
+
+  if (!newGames.length) {
+    toast('Escaneo completado — no se encontraron juegos nuevos.', '');
+    return;
+  }
+
+  // Abrir el picker en cola para cada juego nuevo encontrado
+  toast(`Se encontraron ${newGames.length} juego${newGames.length!==1?'s':''} nuevos. Identifícalos uno a uno.`, 'success');
+  openPickerQueue(newGames);
 }
 
 async function doDetectSteam() {
@@ -240,40 +302,134 @@ async function doDetectSteam() {
 }
 
 function showScanProgress(msg) {
+  // Eliminar cualquier progress anterior que quedara huérfano
+  document.querySelectorAll('.scan-progress').forEach(e => e.remove());
   const el = document.createElement('div');
   el.className = 'scan-progress';
-  el.innerHTML = `<span class="sp-spin">⟳</span> ${msg}`;
+  el.innerHTML = '<span class="sp-spin">⟳</span><span class="sp-msg"> ' + msg + '</span>';
   document.body.appendChild(el);
   return el;
 }
 
+function updateScanProgress(el, msg) {
+  const txt = el.querySelector('.sp-msg');
+  if (txt) txt.textContent = ' ' + msg;
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
-// ── PICKER DE JUEGO (nombre → portada automática) ────────────────────────────
+// ── PICKER DE JUEGO — con cola para escaneo múltiple ─────────────────────────
 // ════════════════════════════════════════════════════════════════════════════════
 
-let pickerExePath    = null;
+let pickerQueue        = [];   // [{ name, exe_path, folderId }, ...]
+let pickerQueueIndex   = 0;
+let pickerExePath      = null;
+let pickerFolderId     = null;
 let pickerPreviewTimer = null;
 
-function openGamePicker(defaultName, exePath) {
-  pickerExePath = exePath;
-  const modal   = document.getElementById('game-picker-modal');
-  const input   = document.getElementById('picker-name');
-  modal.classList.remove('hidden');
-  input.value = defaultName;
-  // Ocultar preview anterior
+// ── Abrir picker para un solo .exe (botón + .exe) ─────────────────────────────
+function openGamePicker(defaultName, exePath, folderId = null) {
+  pickerQueue      = [{ name: defaultName, exe_path: exePath, folderId }];
+  pickerQueueIndex = 0;
+  pickerShowCurrent();
+}
+
+// ── Abrir picker en cola para múltiples juegos (escaneo) ──────────────────────
+function openPickerQueue(games) {
+  if (!games.length) return;
+  pickerQueue      = games;
+  pickerQueueIndex = 0;
+  pickerShowCurrent();
+}
+
+function pickerShowCurrent() {
+  const entry = pickerQueue[pickerQueueIndex];
+  if (!entry) return;
+
+  pickerExePath  = entry.exe_path;
+  pickerFolderId = entry.folderId || null;
+
+  const modal  = document.getElementById('game-picker-modal');
+  const input  = document.getElementById('picker-name');
+  const total  = pickerQueue.length;
+  const current = pickerQueueIndex + 1;
+
+  // Actualizar título con progreso
+  const titleEl = modal.querySelector('h3');
+  if (titleEl) {
+    titleEl.textContent = total > 1
+      ? `Identificar juego (${current} de ${total})`
+      : 'Añadir juego';
+  }
+
+  // Mostrar nombre del exe como referencia
+  const exeNameEl = document.getElementById('picker-exe-ref');
+  if (exeNameEl) exeNameEl.textContent = entry.exe_path.split('\\').pop();
+
+  // Limpiar estado
+  input.value = entry.name;
   document.getElementById('picker-preview').classList.add('hidden');
   document.getElementById('picker-preview-img').style.backgroundImage = '';
   document.getElementById('picker-preview-status').textContent = '';
+
+  // Botón saltar — solo visible si hay cola
+  const skipBtn = document.getElementById('picker-skip');
+  if (skipBtn) skipBtn.classList.toggle('hidden', total <= 1);
+
+  // Botón saltar todo — solo si quedan más de 1
+  const skipAllBtn = document.getElementById('picker-skip-all');
+  if (skipAllBtn) skipAllBtn.classList.toggle('hidden', total - current < 1);
+
+  modal.classList.remove('hidden');
+
+  // Auto-buscar portada con el nombre detectado
+  clearTimeout(pickerPreviewTimer);
+  pickerPreviewTimer = setTimeout(() => pickerFetchPreview(entry.name), 400);
+
   setTimeout(() => { input.focus(); input.select(); }, 80);
 }
 
 function closeGamePicker() {
   document.getElementById('game-picker-modal').classList.add('hidden');
   clearTimeout(pickerPreviewTimer);
-  pickerExePath = null;
+  pickerQueue      = [];
+  pickerQueueIndex = 0;
+  pickerExePath    = null;
+  pickerFolderId   = null;
 }
 
-// Mientras el usuario escribe, esperar 700ms y mostrar preview de la portada
+// Saltar este juego (añadir sin nombre/portada personalizada)
+async function pickerSkip() {
+  const entry = pickerQueue[pickerQueueIndex];
+  if (entry) {
+    // Guardar con el nombre por defecto del exe, sin portada
+    await api.addGame({ name: entry.name, exe_path: entry.exe_path, folder_id: entry.folderId });
+  }
+  pickerNext();
+}
+
+// Saltar todos los restantes (añadir todos con nombre de exe, sin portada)
+async function pickerSkipAll() {
+  for (let i = pickerQueueIndex; i < pickerQueue.length; i++) {
+    const e = pickerQueue[i];
+    await api.addGame({ name: e.name, exe_path: e.exe_path, folder_id: e.folderId });
+  }
+  closeGamePicker();
+  await loadGames();
+  toast('Juegos restantes añadidos sin identificar.', '');
+}
+
+function pickerNext() {
+  pickerQueueIndex++;
+  if (pickerQueueIndex >= pickerQueue.length) {
+    closeGamePicker();
+    loadGames();
+    toast('Todos los juegos identificados.', 'success');
+  } else {
+    pickerShowCurrent();
+  }
+}
+
+// Preview automático mientras escribe
 function pickerOnNameInput() {
   clearTimeout(pickerPreviewTimer);
   const name = document.getElementById('picker-name').value.trim();
@@ -282,9 +438,9 @@ function pickerOnNameInput() {
 }
 
 async function pickerFetchPreview(name) {
-  const preview   = document.getElementById('picker-preview');
-  const imgEl     = document.getElementById('picker-preview-img');
-  const statusEl  = document.getElementById('picker-preview-status');
+  const preview  = document.getElementById('picker-preview');
+  const imgEl    = document.getElementById('picker-preview-img');
+  const statusEl = document.getElementById('picker-preview-status');
 
   preview.classList.remove('hidden');
   imgEl.style.backgroundImage = '';
@@ -292,13 +448,11 @@ async function pickerFetchPreview(name) {
   statusEl.className   = 'picker-preview-status loading';
 
   const coverPath = await api.fetchCoverByName(name);
-
   if (!coverPath) {
-    statusEl.textContent = '✗ No se encontró portada en Steam. Se añadirá sin imagen.';
+    statusEl.textContent = '✗ No se encontró portada. Se añadirá sin imagen.';
     statusEl.className   = 'picker-preview-status error';
     return;
   }
-
   const dataUri = await api.getCoverDataUri(coverPath);
   if (dataUri) {
     imgEl.style.backgroundImage = `url(${dataUri})`;
@@ -316,19 +470,15 @@ async function pickerConfirm() {
   btn.disabled    = true;
   btn.textContent = '⟳ Añadiendo…';
 
-  // Obtener portada (puede ya estar en caché del preview)
   const coverPath = await api.fetchCoverByName(name);
-
-  await api.addGame({ name, exe_path: pickerExePath, cover: coverPath });
-  toast(`✓ ${name} añadido`, 'success');
+  await api.addGame({ name, exe_path: pickerExePath, folder_id: pickerFolderId, cover: coverPath });
 
   btn.disabled    = false;
   btn.textContent = '✓ Añadir juego';
-  closeGamePicker();
-  await loadGames();
+
+  pickerNext();
 }
 
-// Cerrar al hacer click fuera
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('game-picker-modal')?.addEventListener('click', e => {
     if (e.target.id === 'game-picker-modal') closeGamePicker();
@@ -337,15 +487,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── Sidebar carpetas ──────────────────────────────────────────────────────────
 async function renderFolderSidebar() {
-  const list = document.getElementById('folder-list-sidebar');
-  list.innerHTML = '';
-  const folders = await api.getFolders();
-  folders.forEach(f => {
-    const dot = document.createElement('div');
-    dot.className = 'sidebar-folder-dot';
-    dot.innerHTML = `${f.type==='steam'?'🎮':'📁'}<span class="folder-tooltip">${escHtml(f.label||f.path)}</span>`;
-    list.appendChild(dot);
-  });
+  try {
+    const list = document.getElementById('folder-list-sidebar');
+    if (!list) return;
+    list.innerHTML = '';
+    const folders = await api.getFolders();
+    (folders || []).forEach(f => {
+      const dot = document.createElement('div');
+      dot.className = 'sidebar-folder-dot';
+      dot.innerHTML = `${f.type==='steam'?'🎮':'📁'}<span class="folder-tooltip">${escHtml(f.label||f.path)}</span>`;
+      list.appendChild(dot);
+    });
+  } catch(e) { console.error('renderFolderSidebar:', e); }
 }
 
 // ── Recientes / Favoritos ─────────────────────────────────────────────────────
@@ -369,6 +522,7 @@ function renderFavorites() {
 
 // ── Ajustes ───────────────────────────────────────────────────────────────────
 async function renderSettingsView() {
+  try {
   const el = document.getElementById('settings-content');
   if (!el) return;
   const folders   = await api.getFolders();
@@ -419,6 +573,7 @@ async function renderSettingsView() {
       <div class="setting-row"><div class="setting-label">Carpetas indexadas</div><strong style="font-family:var(--font-mono);color:var(--accent)">${folders.length}</strong></div>
       <div style="margin-top:12px"><button class="btn-secondary" onclick="rerunWizard()" style="font-size:11px">↺ Volver a ejecutar el asistente</button></div>
     </div>`;
+  } catch(e) { console.error('renderSettingsView:', e); }
 }
 
 async function removeFolder(id) {
